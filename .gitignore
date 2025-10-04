@@ -1,0 +1,5 @@
+# Do not pin dependencies.
+Cargo.lock
+
+# Do not check in build artifacts.
+/target
