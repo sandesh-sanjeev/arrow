@@ -10,13 +10,13 @@ use crate::sync::{
 /// * [`Self::spin_acquire`] waits to acquire a lock, i.e, not wait-free.
 /// * [`Self::try_acquire`] returns immediately, i.e, if wait-free.
 ///
-/// When lock is acquired, a [`MutGuard`] is returned. You can fearlessly
+/// When lock is acquired, a [`RawLockGuard`] is returned. You can fearlessly
 /// make mutations while holding on the the guard. When the guard goes out
 /// of scope, lock is automatically released.
 #[derive(Debug)]
-pub(crate) struct MutLock(AtomicBool);
+pub(crate) struct RawLock(AtomicBool);
 
-impl MutLock {
+impl RawLock {
     /// Create a new exclusive write lock.
     ///
     /// Note that this in itself does not acquire the newly created lock.
@@ -24,7 +24,7 @@ impl MutLock {
     /// [`Self::try_acquire`].
     #[inline]
     pub(crate) const fn new() -> Self {
-        MutLock(AtomicBool::new(false))
+        RawLock(AtomicBool::new(false))
     }
 
     /// Acquire an exclusive lock is acquired.
@@ -36,7 +36,7 @@ impl MutLock {
     ///
     /// For a wait-free alternative, use [`Self::try_acquire`].
     #[inline]
-    pub(crate) fn spin_acquire(&self) -> MutGuard<'_> {
+    pub(crate) fn spin_acquire(&self) -> RawLockGuard<'_> {
         while self.0.swap(true, Acquire) {
             // Hint to CPU that this is a spin loop.
             // This allows the CPU to perform certain optimizations,
@@ -44,7 +44,7 @@ impl MutLock {
             spin_loop();
         }
 
-        MutGuard(&self.0)
+        RawLockGuard(&self.0)
     }
 
     /// Try to acquire an exclusive lock.
@@ -52,12 +52,12 @@ impl MutLock {
     /// This always returns immediately. Lock guard is returned if successful,
     /// i.e, no other thread was holding the lock. None is returned otherwise.
     #[inline]
-    pub(crate) fn try_acquire(&self) -> Option<MutGuard<'_>> {
+    pub(crate) fn try_acquire(&self) -> Option<RawLockGuard<'_>> {
         if self.0.swap(true, Acquire) {
             return None;
         }
 
-        Some(MutGuard(&self.0))
+        Some(RawLockGuard(&self.0))
     }
 }
 
@@ -65,9 +65,9 @@ impl MutLock {
 ///
 /// When this guard goes out of scope, lock is automatically released.
 #[derive(Debug)]
-pub(crate) struct MutGuard<'a>(&'a AtomicBool);
+pub(crate) struct RawLockGuard<'a>(&'a AtomicBool);
 
-impl Drop for MutGuard<'_> {
+impl Drop for RawLockGuard<'_> {
     #[inline]
     fn drop(&mut self) {
         self.0.store(false, Release);
@@ -83,8 +83,8 @@ mod tests {
 
     #[test]
     #[allow(static_mut_refs)]
-    fn test_mut_lock() {
-        static LOCK: MutLock = MutLock::new();
+    fn state_machine_test() {
+        static LOCK: RawLock = RawLock::new();
         static mut DATA: Vec<usize> = Vec::new();
 
         thread::scope(|scope| {
