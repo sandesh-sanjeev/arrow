@@ -2,7 +2,3 @@
 name = "arrow"
 version = "0.1.0"
 edition = "2024"
-
-[dependencies]
-# For nicer error handling.
-thiserror = "2.0"
