@@ -324,46 +324,110 @@ impl Drop for AppendTxn<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use anyhow::{Result, anyhow};
+    use anyhow::{Error, Result};
+    use std::{sync::atomic::AtomicUsize, thread};
     use tempfile::tempdir;
 
+    const WRITERS: usize = 5;
+    const READERS: usize = 5;
+    const RECORD_SIZE: usize = 8;
+
     #[test]
-    fn storage_state_machine() -> Result<()> {
+    fn concurrent_access_test() -> Result<()> {
         let dir = tempdir()?;
 
         // Create storage at a specified path.
-        let path = dir.path().join("test_storage");
+        let path = dir.path().join("test.storage");
         let storage = Storage::create(path)?;
 
-        // Append some bytes into storage.
-        let mut txn = storage
-            .append_txn()
-            .ok_or(anyhow!("Cannot start append transaction"))?;
+        // Writes to make against storage.
+        let index = AtomicUsize::new(0);
+        let appends: Vec<_> = (0..10000u64).map(|num| num.to_be_bytes()).collect();
 
-        txn.append(b"mouse")?;
-        txn.append(b"trap")?;
-        txn.commit(true)?;
+        // Have multiple threads attempt to read and write from storage.
+        thread::scope(|scope| {
+            // Writers attempting to insert data into storage.
+            let mut writers = Vec::new();
+            for _ in 0..WRITERS {
+                writers.push(scope.spawn(|| {
+                    loop {
+                        // Create transaction to append data into storage.
+                        if let Some(mut txn) = storage.append_txn() {
+                            // Figure out next index to append into storage.
+                            let next_index = index.fetch_add(1, Relaxed);
+                            if next_index >= appends.len() {
+                                break; // All writes are complete.
+                            }
 
-        // A transaction to abort.
-        let mut txn = storage
-            .append_txn()
-            .ok_or(anyhow!("Cannot start append transaction"))?;
+                            // Fetch next index to write into storage.
+                            let data = &appends[next_index];
+                            assert_eq!(RECORD_SIZE, data.len());
 
-        txn.append(b"batman")?;
-        drop(txn);
+                            // Write data in index into storage.
+                            txn.append(data)?;
+                            txn.commit(false)?;
+                        }
+                    }
 
-        // Read from storage and make sure bytes are visible.
+                    Ok::<_, Error>(())
+                }));
+            }
+
+            // Readers attempting to read data from storage.
+            let mut readers = Vec::new();
+            for _ in 0..READERS {
+                readers.push(scope.spawn(|| {
+                    let mut index = 0;
+                    loop {
+                        // Figure out the next piece of data to read.
+                        if index >= appends.len() {
+                            break;
+                        }
+
+                        // Attempt to read data from storage.
+                        let offset = (index * RECORD_SIZE) as u64;
+                        if let Some(mut txn) = storage.read_txn(offset) {
+                            // Read data in offset.
+                            let mut data = [0; 8];
+                            txn.read_exact(&mut data)?;
+
+                            // Make sure contents of data is as expected.
+                            assert_eq!(&data, &appends[index]);
+                            index += 1;
+                        }
+                    }
+
+                    Ok::<_, Error>(())
+                }));
+            }
+
+            // Wait for all workers to complete.
+            for handle in writers.into_iter().chain(readers.into_iter()) {
+                handle
+                    .join()
+                    .expect("Worker should join successfully")
+                    .expect("Worker should complete successfully");
+            }
+        });
+
+        // Flush all writes to disk.
+        storage.flush()?;
+
+        // Final verification to make sure bytes in storage is correct.
         let mut txn = storage
             .read_txn(0)
-            .ok_or(anyhow!("Cannot start read transaction"))?;
+            .expect("A read transaction should start successfully");
 
-        let remaining = txn.remaining();
-        let mut buf = vec![0; remaining];
-        txn.read_exact(&mut buf)?;
-        assert_eq!(&buf, b"mousetrap");
+        // Read all the bytes from storage.
+        let mut data = vec![0; appends.len() * RECORD_SIZE];
+        txn.read_exact(&mut data)?;
 
-        // Destroy storage.
-        assert!(storage.destroy().is_ok());
+        // Make sure bytes in disk is correct.
+        let expected: Vec<_> = appends.iter().flat_map(|data| *data).collect();
+        assert_eq!(expected, data);
+
+        // Finally get rid of storage.
+        storage.destroy().map_err(|(_, e)| e)?;
         Ok(())
     }
 }
