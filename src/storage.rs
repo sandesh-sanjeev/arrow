@@ -234,7 +234,8 @@ impl ReadTxn<'_> {
 /// Changes made in the transaction are not visible to other transactions (across threads),
 /// unless it is successfully committed via [`AppendTxn::commit`]. If transaction goes out
 /// of scope without explicit commit then it is implicitly aborted.  When this happens, any
-/// bytes appended will be rolled back.
+/// bytes appended will be rolled back. However, explicit abort via [`AppendTxn::abort`] is
+/// still recommended so that you can handle errors.
 pub struct AppendTxn<'a> {
     next: u64,
     start: u64,
@@ -280,6 +281,21 @@ impl AppendTxn<'_> {
         // Release the changes made in this transaction to other threads.
         self.len.store(self.next, Release);
         self.commit = true; // To support abort without commit.
+        Ok(())
+    }
+
+    /// Abort the transaction.
+    ///
+    /// This rolls back changes accumulated in the transaction. If this operation
+    /// is successful, appends from this transaction will never be visible in other
+    /// transaction. If it does error out, storage is in undefined state.
+    pub fn abort(mut self) -> io::Result<()> {
+        if self.next != self.start {
+            self.file.set_len(self.start)?;
+        }
+
+        // To make sure truncation does not happen during drop.
+        self.next = self.start;
         Ok(())
     }
 }
