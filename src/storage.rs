@@ -260,16 +260,18 @@ impl AppendTxn<'_> {
     /// Commit the transaction.
     ///
     /// Finalizes the transaction and commits any writes into storage.
+    /// Returns the offset in file where next will will occur. That is
+    /// also the size of storage at the end of this transaction.
     ///
     /// # Arguments
     ///
     /// * `flush` - Sync data to disk, flushing any intermediate buffers.
-    pub fn commit(mut self, flush: bool) -> io::Result<()> {
+    pub fn commit(mut self, flush: bool) -> io::Result<u64> {
         // If no writes where made in this transaction,
         // we can skip some syscalls and atomic operations.
         if self.start == self.next {
             self.commit = true;
-            return Ok(());
+            return Ok(self.next);
         }
 
         // Flush writes to disk to guarantee durability.
@@ -281,7 +283,7 @@ impl AppendTxn<'_> {
         // Release the changes made in this transaction to other threads.
         self.len.store(self.next, Release);
         self.commit = true; // To support abort without commit.
-        Ok(())
+        Ok(self.next)
     }
 
     /// Abort the transaction.
