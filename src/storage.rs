@@ -102,7 +102,7 @@ impl Storage {
         Some(AppendTxn {
             next: len,
             start: len,
-            commit: false,
+            complete: false,
             file: &self.file,
             len: &self.len,
             lock: &self.lock,
@@ -133,6 +133,29 @@ impl Storage {
             next: offset,
             file: &self.file,
         })
+    }
+
+    /// Truncate storage to new length.
+    ///
+    /// Bytes will be removed from the end of storage.
+    ///
+    /// # Arguments
+    ///
+    /// * `len` - New length of storage.
+    pub fn truncate(self, len: u64) -> Result<(), (Self, io::Error)> {
+        // Only truncate if there are some bytes to truncate.
+        let storage_len = self.len.load(Acquire);
+        if len <= storage_len {
+            return Ok(());
+        }
+
+        // Resize storage.
+        // Because of the check above, guaranteed to only truncate.
+        let Err(e) = self.file.set_len(len) else {
+            return Ok(());
+        };
+
+        Err((self, e))
     }
 
     /// Destroy storage.
@@ -239,7 +262,7 @@ impl ReadTxn<'_> {
 pub struct AppendTxn<'a> {
     next: u64,
     start: u64,
-    commit: bool,
+    complete: bool,
     file: &'a File,
     len: &'a AtomicU64,
     lock: &'a AtomicBool,
@@ -267,22 +290,23 @@ impl AppendTxn<'_> {
     ///
     /// * `flush` - Sync data to disk, flushing any intermediate buffers.
     pub fn commit(mut self, flush: bool) -> io::Result<u64> {
-        // If no writes where made in this transaction,
-        // we can skip some syscalls and atomic operations.
-        if self.start == self.next {
-            self.commit = true;
-            return Ok(self.next);
-        }
-
         // Flush writes to disk to guarantee durability.
-        // This affects performance, so is optional.
-        if flush {
+        // This quite severely affects performance, so is optional.
+        // We only perform this operation if there was some change made in transaction.
+        if flush && self.start != self.next {
             self.file.sync_data()?;
         }
 
         // Release the changes made in this transaction to other threads.
-        self.len.store(self.next, Release);
-        self.commit = true; // To support abort without commit.
+        if self.start != self.next {
+            self.len.store(self.next, Release);
+        }
+
+        // Mark transaction as explicitly completed.
+        // This prevents implicit abort during drop.
+        self.complete = true;
+
+        // Return offset for next write.
         Ok(self.next)
     }
 
@@ -291,14 +315,22 @@ impl AppendTxn<'_> {
     /// This rolls back changes accumulated in the transaction. If this operation
     /// is successful, appends from this transaction will never be visible in other
     /// transaction. If it does error out, storage is in undefined state.
-    pub fn abort(mut self) -> io::Result<()> {
+    ///
+    /// Returns the offset in file where next will will occur. That is also the size
+    /// of storage at the end of this transaction.
+    pub fn abort(mut self) -> io::Result<u64> {
+        // Undo changes made in this transaction by truncating the underlying file.
+        // We only perform this operation if there was some change made in transaction.
         if self.next != self.start {
             self.file.set_len(self.start)?;
         }
 
-        // To make sure truncation does not happen during drop.
-        self.next = self.start;
-        Ok(())
+        // Mark transaction as explicitly completed.
+        // This prevents implicit abort during drop.
+        self.complete = true;
+
+        // Return offset for next write.
+        Ok(self.start)
     }
 }
 
@@ -307,7 +339,7 @@ impl Drop for AppendTxn<'_> {
         // If the transaction was completed without being committed
         // it's implicitly aborted. If there were some (successful)
         // writes into storage, then we undo that now.
-        if !self.commit && self.start != self.next {
+        if !self.complete && self.start != self.next {
             // There is no way to return an error back from destructor.
             // The best we can do is to attempt (unless panic). It it
             // okay, because new offset will not be visible to anyone.
@@ -333,7 +365,7 @@ mod tests {
     const RECORD_SIZE: usize = 8;
 
     #[test]
-    fn concurrent_access_test() -> Result<()> {
+    fn concurrency_tests() -> Result<()> {
         let dir = tempdir()?;
 
         // Create storage at a specified path.
@@ -347,9 +379,8 @@ mod tests {
         // Have multiple threads attempt to read and write from storage.
         thread::scope(|scope| {
             // Writers attempting to insert data into storage.
-            let mut writers = Vec::new();
             for _ in 0..WRITERS {
-                writers.push(scope.spawn(|| {
+                scope.spawn(|| {
                     loop {
                         // Create transaction to append data into storage.
                         if let Some(mut txn) = storage.append_txn() {
@@ -370,13 +401,12 @@ mod tests {
                     }
 
                     Ok::<_, Error>(())
-                }));
+                });
             }
 
             // Readers attempting to read data from storage.
-            let mut readers = Vec::new();
             for _ in 0..READERS {
-                readers.push(scope.spawn(|| {
+                scope.spawn(|| {
                     let mut index = 0;
                     loop {
                         // Figure out the next piece of data to read.
@@ -387,8 +417,11 @@ mod tests {
                         // Attempt to read data from storage.
                         let offset = (index * RECORD_SIZE) as u64;
                         if let Some(mut txn) = storage.read_txn(offset) {
+                            // Make sure enough bytes are available for reads.
+                            assert!(txn.remaining() >= RECORD_SIZE);
+
                             // Read data in offset.
-                            let mut data = [0; 8];
+                            let mut data = [0; RECORD_SIZE];
                             txn.read_exact(&mut data)?;
 
                             // Make sure contents of data is as expected.
@@ -398,15 +431,7 @@ mod tests {
                     }
 
                     Ok::<_, Error>(())
-                }));
-            }
-
-            // Wait for all workers to complete.
-            for handle in writers.into_iter().chain(readers.into_iter()) {
-                handle
-                    .join()
-                    .expect("Worker should join successfully")
-                    .expect("Worker should complete successfully");
+                });
             }
         });
 
