@@ -52,16 +52,37 @@ impl PartialOrd for Log<'_> {
 pub struct LogVec {
     count: usize,
     memory: Vec<u8>,
-    last_seq_no: Option<u64>,
+    prev_seq_no: Option<u64>,
 }
 
 impl LogVec {
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
             count: 0,
-            last_seq_no: None,
+            prev_seq_no: None,
             memory: Vec::with_capacity(capacity),
         }
+    }
+
+    pub(crate) fn overwrite<F, E>(&mut self, mut f: F) -> Result<(), E>
+    where
+        F: FnMut(&mut [u8]) -> Result<usize, E>,
+    {
+        // Allow overwrites to backing memory.
+        self.memory.resize(self.capacity(), 0);
+        let written = f(&mut self.memory)?;
+        self.memory.truncate(written);
+
+        // Initialize state of the vec.
+        self.count = 0;
+        self.prev_seq_no = None;
+        let mut logs = LogVecIter(&self.memory);
+        while let Some(log) = logs.next() {
+            self.count += 1;
+            self.prev_seq_no = Some(log.seq_no());
+        }
+
+        Ok(())
     }
 
     pub fn count(&self) -> usize {
@@ -80,15 +101,23 @@ impl LogVec {
         self.iter().next().map(|log| log.seq_no())
     }
 
-    pub fn last_seq_no(&self) -> Option<u64> {
-        self.last_seq_no
+    pub fn prev_seq_no(&self) -> Option<u64> {
+        self.prev_seq_no
     }
 
     pub fn iter(&self) -> LogVecIter<'_> {
         LogVecIter(&self.memory)
     }
 
-    pub fn append(&mut self, log: Log<'_>) {
+    #[must_use = "returns true only if sequence validation is successful"]
+    pub fn append(&mut self, log: Log<'_>) -> bool {
+        // Perform sequence validation.
+        if let Some(prev_seq_no) = self.prev_seq_no
+            && prev_seq_no >= log.seq_no()
+        {
+            return false;
+        }
+
         // Bytes that represent sequence number.
         let seq_no_bytes = log.seq_no.to_be_bytes();
         self.memory.extend_from_slice(&seq_no_bytes);
@@ -105,13 +134,16 @@ impl LogVec {
         // Write payload bytes into this memory.
         self.memory.extend_from_slice(data_bytes);
 
-        // Finally keep track of the size.
+        // Keep track of the new state.
         self.count += 1;
+        self.prev_seq_no = Some(log.seq_no());
+        true
     }
 
     pub fn clear(&mut self) {
         self.count = 0;
         self.memory.clear();
+        self.prev_seq_no = None;
     }
 
     pub fn shrink_to(&mut self, capacity: usize) {
