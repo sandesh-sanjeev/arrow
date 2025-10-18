@@ -3,21 +3,10 @@ name = "arrow"
 version = "0.1.0"
 edition = "2024"
 
-[features]
-benchmark = ["dep:clap", "dep:anyhow", "dep:tempfile", "dep:crossbeam-channel"]
-
-[[bin]]
-name = "bench_storage"
-path = "benchmarks/storage.rs"
-required-features = ["benchmark"]
-
 [dependencies]
-clap = { version = "4.5", features = ["derive"], optional = true }
-anyhow = { version = "1.0", optional = true }
-tempfile = { version = "3.23", optional = true }
-crossbeam-channel = { version = "0.5", optional = true }
+crossbeam-epoch = "0.9"
+crossbeam-utils = "0.8"
 
 [dev-dependencies]
 anyhow = "1.0"
 tempfile = "3.23"
-crossbeam-channel = "0.5"

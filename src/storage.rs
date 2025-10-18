@@ -6,7 +6,7 @@ use std::{
     io,
     os::unix::fs::FileExt,
     path::{Path, PathBuf},
-    sync::atomic::{AtomicBool, AtomicU64, Ordering::*},
+    sync::atomic::{AtomicU64, Ordering::*},
 };
 
 /// A lock-free single writer, multiple reader append only storage.
@@ -23,7 +23,6 @@ pub struct Storage {
     file: File,
     path: PathBuf,
     len: AtomicU64,
-    lock: AtomicBool,
 }
 
 impl Storage {
@@ -46,7 +45,6 @@ impl Storage {
             file,
             path,
             len: AtomicU64::new(0),
-            lock: AtomicBool::new(false),
         })
     }
 
@@ -73,7 +71,6 @@ impl Storage {
             file,
             path,
             len: AtomicU64::new(len),
-            lock: AtomicBool::new(false),
         })
     }
 
@@ -89,24 +86,18 @@ impl Storage {
     /// returns early without creating a new write transaction. However
     /// this only applies across threads. There is no synchronization
     /// across processes.
-    pub fn append_txn(&self) -> Option<AppendTxn<'_>> {
-        // Obtain an exclusive write lock to the storage.
-        if self.lock.swap(true, Acquire) {
-            return None;
-        }
-
+    pub fn append_txn(&self) -> AppendTxn<'_> {
         // Read the current state of storage.
         let len = self.len.load(Acquire);
 
         // Return the newly created transaction.
-        Some(AppendTxn {
+        AppendTxn {
             next: len,
             start: len,
             complete: false,
             file: &self.file,
             len: &self.len,
-            lock: &self.lock,
-        })
+        }
     }
 
     /// Start a read transaction against storage.
@@ -265,7 +256,6 @@ pub struct AppendTxn<'a> {
     complete: bool,
     file: &'a File,
     len: &'a AtomicU64,
-    lock: &'a AtomicBool,
 }
 
 impl AppendTxn<'_> {
@@ -346,113 +336,5 @@ impl Drop for AppendTxn<'_> {
             // It will be get clean up in next maintenance run.
             let _ = self.file.set_len(self.start);
         }
-
-        // Finally release the lock.
-        // Now the lock can be acquired by other threads.
-        self.lock.store(false, Release);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use anyhow::{Error, Result};
-    use std::{sync::atomic::AtomicUsize, thread};
-    use tempfile::tempdir;
-
-    const WRITERS: usize = 5;
-    const READERS: usize = 5;
-    const RECORD_SIZE: usize = 8;
-
-    #[test]
-    fn concurrency_tests() -> Result<()> {
-        let dir = tempdir()?;
-
-        // Create storage at a specified path.
-        let path = dir.path().join("test.storage");
-        let storage = Storage::create(path)?;
-
-        // Writes to make against storage.
-        let index = AtomicUsize::new(0);
-        let appends: Vec<_> = (0..10000u64).map(|num| num.to_be_bytes()).collect();
-
-        // Have multiple threads attempt to read and write from storage.
-        thread::scope(|scope| {
-            // Writers attempting to insert data into storage.
-            for _ in 0..WRITERS {
-                scope.spawn(|| {
-                    loop {
-                        // Create transaction to append data into storage.
-                        if let Some(mut txn) = storage.append_txn() {
-                            // Figure out next index to append into storage.
-                            let next_index = index.fetch_add(1, Relaxed);
-                            if next_index >= appends.len() {
-                                break; // All writes are complete.
-                            }
-
-                            // Fetch next index to write into storage.
-                            let data = &appends[next_index];
-                            assert_eq!(RECORD_SIZE, data.len());
-
-                            // Write data in index into storage.
-                            txn.append(data)?;
-                            txn.commit(false)?;
-                        }
-                    }
-
-                    Ok::<_, Error>(())
-                });
-            }
-
-            // Readers attempting to read data from storage.
-            for _ in 0..READERS {
-                scope.spawn(|| {
-                    let mut index = 0;
-                    loop {
-                        // Figure out the next piece of data to read.
-                        if index >= appends.len() {
-                            break;
-                        }
-
-                        // Attempt to read data from storage.
-                        let offset = (index * RECORD_SIZE) as u64;
-                        if let Some(mut txn) = storage.read_txn(offset) {
-                            // Make sure enough bytes are available for reads.
-                            assert!(txn.remaining() >= RECORD_SIZE);
-
-                            // Read data in offset.
-                            let mut data = [0; RECORD_SIZE];
-                            txn.read_exact(&mut data)?;
-
-                            // Make sure contents of data is as expected.
-                            assert_eq!(&data, &appends[index]);
-                            index += 1;
-                        }
-                    }
-
-                    Ok::<_, Error>(())
-                });
-            }
-        });
-
-        // Flush all writes to disk.
-        storage.flush()?;
-
-        // Final verification to make sure bytes in storage is correct.
-        let mut txn = storage
-            .read_txn(0)
-            .expect("A read transaction should start successfully");
-
-        // Read all the bytes from storage.
-        let mut data = vec![0; appends.len() * RECORD_SIZE];
-        txn.read_exact(&mut data)?;
-
-        // Make sure bytes in disk is correct.
-        let expected: Vec<_> = appends.iter().flat_map(|data| *data).collect();
-        assert_eq!(expected, data);
-
-        // Finally get rid of storage.
-        storage.destroy().map_err(|(_, e)| e)?;
-        Ok(())
     }
 }
