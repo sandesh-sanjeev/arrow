@@ -4,6 +4,7 @@ use std::{io, path::Path};
 
 pub struct Page {
     storage: Storage,
+    page_prev_seq_no: u64,
     state: AtomicCell<State>,
 }
 
@@ -15,7 +16,25 @@ impl Page {
             prev_seq_no,
         });
 
-        Ok(Self { storage, state })
+        // Header for the page.
+        let mut txn = storage.append_txn();
+        txn.append(&1u64.to_be_bytes())?;
+        txn.append(&prev_seq_no.to_be_bytes())?;
+        txn.commit(true)?;
+
+        Ok(Self {
+            storage,
+            state,
+            page_prev_seq_no: prev_seq_no,
+        })
+    }
+
+    pub fn page_prev_seq_no(&self) -> u64 {
+        self.page_prev_seq_no
+    }
+
+    pub fn state(&self) -> State {
+        self.state.load()
     }
 
     pub fn append(&self, logs: &LogVec, flush: bool) -> io::Result<bool> {
@@ -66,3 +85,9 @@ pub struct State {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Cursor(u64);
+
+impl Cursor {
+    /// Index to first log in the page.
+    /// If page is empty, the log itself might not exist.
+    pub const ZERO: Cursor = Cursor(16);
+}
