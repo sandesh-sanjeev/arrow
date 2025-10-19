@@ -1,4 +1,4 @@
-use crate::{log::LogVec, storage::Storage};
+use crate::{lock::MutGuard, log::LogVec, storage::Storage};
 use crossbeam_utils::atomic::AtomicCell;
 use std::{io, path::Path};
 
@@ -9,7 +9,7 @@ pub struct Page {
 }
 
 impl Page {
-    pub fn create<P: AsRef<Path>>(path: P, prev_seq_no: u64) -> io::Result<Self> {
+    pub fn create<P: AsRef<Path>>(path: P, prev_seq_no: u64, guard: &MutGuard) -> io::Result<Self> {
         let storage = Storage::create(path)?;
         let state = AtomicCell::new(State {
             count: 0,
@@ -17,10 +17,10 @@ impl Page {
         });
 
         // Header for the page.
-        let mut txn = storage.append_txn();
-        txn.append(&1u64.to_be_bytes())?;
-        txn.append(&prev_seq_no.to_be_bytes())?;
-        txn.commit(true)?;
+        let mut buf = Vec::with_capacity(16);
+        buf.extend_from_slice(&1u64.to_be_bytes());
+        buf.extend_from_slice(&prev_seq_no.to_be_bytes());
+        storage.append(&buf, guard)?;
 
         Ok(Self {
             storage,
@@ -37,7 +37,7 @@ impl Page {
         self.state.load()
     }
 
-    pub fn append(&self, logs: &LogVec, flush: bool) -> io::Result<bool> {
+    pub fn append(&self, logs: &LogVec, guard: &MutGuard) -> io::Result<bool> {
         // Return early if there is nothing to append.
         let (Some(first), Some(last)) = (logs.first_seq_no(), logs.prev_seq_no()) else {
             return Ok(false);
@@ -51,9 +51,7 @@ impl Page {
         }
 
         // Nice, we can write out log bytes.
-        let mut txn = self.storage.append_txn();
-        txn.append(logs.bytes())?;
-        txn.commit(flush)?;
+        self.storage.append(logs.bytes(), guard)?;
 
         // Update state with new logs.
         state.count += logs.count();
@@ -63,14 +61,7 @@ impl Page {
     }
 
     pub fn query(&self, logs: &mut LogVec, cursor: Cursor) -> io::Result<Cursor> {
-        // Return early if there is nothing new to read.
-        let Some(mut txn) = self.storage.read_txn(cursor.0) else {
-            return Ok(cursor);
-        };
-
-        // Overwrite with new logs from storage.
-        // It's possible we didn't read anything.
-        logs.overwrite(|buf| txn.read(buf))?;
+        logs.overwrite(|buf| self.storage.read_at(cursor.0, buf))?;
 
         // Return pointer to next set of logs.
         Ok(Cursor(cursor.0 + logs.bytes().len() as u64))

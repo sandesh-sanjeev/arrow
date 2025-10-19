@@ -109,7 +109,7 @@ impl LogVec {
         LogVecIter(&self.memory)
     }
 
-    #[must_use = "returns true only if sequence validation is successful"]
+    #[must_use = "returns true only if appended successfully"]
     pub fn append(&mut self, log: Log<'_>) -> bool {
         // Perform sequence validation.
         if let Some(prev_seq_no) = self.prev_seq_no

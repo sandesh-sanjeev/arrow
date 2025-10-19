@@ -1,24 +1,15 @@
 //! Append only storage backed by file on disk.
 
+use crate::lock::MutGuard;
 use std::{
     cmp::min,
     fs::{self, File, OpenOptions},
-    io,
+    io::{Error, ErrorKind, Result},
     os::unix::fs::FileExt,
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering::*},
 };
 
-/// A lock-free single writer, multiple reader append only storage.
-///
-/// The only reason this is not wait free is because disk I/O is inherently
-/// a blocking operation. It is indeed wait free in the sense that no wait
-/// occur for any internal locking.
-///
-/// This data structure is thread safe, but not safe for concurrent access
-/// or mutation across processes. We will probably never support synchronization
-/// across processes, except for attempting to prevent such a case using advisory
-/// file locks.
 pub struct Storage {
     file: File,
     path: PathBuf,
@@ -33,8 +24,7 @@ impl Storage {
     /// # Arguments
     ///
     /// * `path` - Path to the file on disk.
-    pub fn create<P: AsRef<Path>>(path: P) -> io::Result<Self> {
-        let path = path.as_ref().to_path_buf();
+    pub fn create<P: AsRef<Path>>(path: P) -> Result<Self> {
         let file = OpenOptions::new()
             .create_new(true)
             .read(true)
@@ -43,8 +33,8 @@ impl Storage {
 
         Ok(Self {
             file,
-            path,
             len: AtomicU64::new(0),
+            path: path.as_ref().to_path_buf(),
         })
     }
 
@@ -55,8 +45,7 @@ impl Storage {
     /// # Arguments
     ///
     /// * `path` - Path to the file on disk.
-    pub fn open<P: AsRef<Path>>(path: P) -> io::Result<Self> {
-        let path = path.as_ref().to_path_buf();
+    pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         let file = OpenOptions::new()
             .create(false)
             .read(true)
@@ -69,61 +58,90 @@ impl Storage {
 
         Ok(Self {
             file,
-            path,
             len: AtomicU64::new(len),
+            path: path.as_ref().to_path_buf(),
         })
+    }
+
+    /// Append some bytes into storage.
+    ///
+    /// # Arguments
+    ///
+    /// * `buf` - Bytes to write into storage.
+    /// * `_guard` - Lock guard for exclusive mutable appends.
+    pub fn append(&self, buf: &[u8], _guard: &MutGuard) -> Result<()> {
+        // If there is nothing to append, return early.
+        if buf.is_empty() {
+            return Ok(());
+        }
+
+        // Write buffer into file.
+        let len = self.len.load(Acquire);
+        self.file.write_all_at(buf, len)?;
+
+        // Update length of the file.
+        let new_len = len + buf.len() as u64;
+        self.len.store(new_len, Release);
+        Ok(())
+    }
+
+    /// Read next set of bytes from storage.
+    ///
+    /// May return lesser than requested, if any bytes are written, they are
+    /// guaranteed to be at the beginning of the buffer. Number of bytes written
+    /// is return, if the read was successful. Use [`Self::read_exact_at`] to read
+    /// exact number of bytes.
+    ///
+    /// If an error occurs, contents of the buffer is undefined.
+    ///
+    /// # Arguments
+    ///
+    /// * `buf` - Buffer to write bytes read from disk.
+    pub fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize> {
+        let dst = self.size_read_buf(offset, buf);
+
+        // Read from the file only if we have to.
+        if dst.is_empty() {
+            return Ok(0);
+        }
+
+        // Read as many bytes as the kernel returns.
+        self.file.read_at(dst, offset)
+    }
+
+    /// Read next set of bytes from storage.
+    ///
+    /// Returns an error if end of file is reached before buffer is filled. Use
+    /// [`Self::read_at`] to read as many bytes as available.
+    ///
+    /// If an error occurs, contents of the buffer is undefined.
+    ///
+    /// # Arguments
+    ///
+    /// * `buf` - Buffer to write bytes read from disk.
+    pub fn read_exact_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
+        let len = buf.len();
+        let dst = self.size_read_buf(offset, buf);
+
+        // Make sure there is enough remaining bytes to fill buffer.
+        if len != dst.len() {
+            let kind = ErrorKind::UnexpectedEof;
+            return Err(Error::new(kind, "EOF without filling buffer"));
+        }
+
+        // Read from the file only if we have to.
+        if dst.is_empty() {
+            return Ok(());
+        }
+
+        // Read bytes to fill the buffer completely.
+        self.file.read_exact_at(dst, offset)
     }
 
     /// Flushes any intermediate buffers in between the disk,
     /// guaranteeing that writes have made it to disk.
-    pub fn flush(&self) -> io::Result<()> {
+    pub fn sync(&self) -> Result<()> {
         self.file.sync_data()
-    }
-
-    /// Start a write transaction against storage.
-    ///
-    /// If there is another write transaction in progress, this method
-    /// returns early without creating a new write transaction. However
-    /// this only applies across threads. There is no synchronization
-    /// across processes.
-    pub fn append_txn(&self) -> AppendTxn<'_> {
-        // Read the current state of storage.
-        let len = self.len.load(Acquire);
-
-        // Return the newly created transaction.
-        AppendTxn {
-            next: len,
-            start: len,
-            complete: false,
-            file: &self.file,
-            len: &self.len,
-        }
-    }
-
-    /// Start a read transaction against storage.
-    ///
-    /// If starting offset is beyond the end of storage, this method
-    /// returns early without creating a new read transaction.
-    ///
-    /// Provides snapshot read isolation level. You will read state as
-    /// it existed when the transaction begun.
-    ///
-    /// # Arguments
-    ///
-    /// * `offset` - Offset in storage to begin reads.
-    pub fn read_txn(&self, offset: u64) -> Option<ReadTxn<'_>> {
-        // Read the current state of storage.
-        let len = self.len.load(Acquire);
-        if offset >= len {
-            return None;
-        }
-
-        // Return the newly created transaction.
-        Some(ReadTxn {
-            len,
-            next: offset,
-            file: &self.file,
-        })
     }
 
     /// Truncate storage to new length.
@@ -133,208 +151,144 @@ impl Storage {
     /// # Arguments
     ///
     /// * `len` - New length of storage.
-    pub fn truncate(self, len: u64) -> Result<(), (Self, io::Error)> {
+    pub fn truncate(&mut self, len: u64) -> Result<()> {
         // Only truncate if there are some bytes to truncate.
         let storage_len = self.len.load(Acquire);
-        if len <= storage_len {
+        if len >= storage_len {
             return Ok(());
         }
 
         // Resize storage.
         // Because of the check above, guaranteed to only truncate.
-        let Err(e) = self.file.set_len(len) else {
-            return Ok(());
-        };
-
-        Err((self, e))
+        self.file.set_len(len)?;
+        self.len.store(len, Release);
+        Ok(())
     }
 
     /// Destroy storage.
     ///
     /// This deletes the underlying file that backs this storage.
-    pub fn destroy(self) -> Result<(), (Self, io::Error)> {
-        fs::remove_file(&self.path).map_err(|e| (self, e))
+    pub fn destroy(self) -> Result<()> {
+        fs::remove_file(&self.path)
     }
 
     /// Gracefully shutdown storage.
     ///
     /// If this method completes successfully, all writes made to storage is
     /// guaranteed to be durably stored on disk.
-    pub fn close(self) -> io::Result<()> {
-        // Now we can attempt to clean up any unclean transaction shutdown.
-        let file_len = self.file.metadata()?.len();
-        let storage_len = self.len.load(Acquire);
-        if file_len > storage_len {
-            self.file.set_len(storage_len)?;
-        }
-
-        // Flush to disk.
-        // This makes sure all writes have been durably stored to disk.
-        self.flush()
+    pub fn close(self) -> Result<()> {
+        self.sync()
     }
-}
 
-/// A read transaction against storage.
-///
-/// A read transaction provides snapshot isolation only, i.e, a read transaction
-/// will view storage as it was when the transaction started.
-pub struct ReadTxn<'a> {
-    len: u64,
-    next: u64,
-    file: &'a File,
-}
-
-impl ReadTxn<'_> {
-    /// Read next set of bytes from storage.
-    ///
-    /// It is okay for this operation to read lesser number of bytes
-    /// than size of buffer. And this might happen even if there are
-    /// more bytes to read from storage. To read exact size of buffer,
-    /// use [`ReadTxn::read_exact`].
+    /// Size read buffer to make sure it does not exceed EOF.
     ///
     /// # Arguments
     ///
-    /// * `buf` - Buffer to write bytes read from disk.
-    pub fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let remaining = self.remaining();
-        let (dst, _) = buf.split_at_mut(min(remaining, buf.len()));
-
-        // Read from disk only if there is something to read.
-        let mut read = 0;
-        if !dst.is_empty() {
-            read = self.file.read_at(buf, self.next)?;
-            self.next += read as u64;
+    /// * `offset` - Offset to start reads from.
+    /// * `buf` - Buffer to write data read from storage.
+    fn size_read_buf<'b>(&self, offset: u64, buf: &'b mut [u8]) -> &'b mut [u8] {
+        // Buffer is empty, nothing to read.
+        if buf.is_empty() {
+            return buf;
         }
 
-        Ok(read)
-    }
+        // Read the current state of storage.
+        let len = self.len.load(Acquire);
 
-    /// Read next set of bytes from storage.
-    ///
-    /// Reads exact number of bytes to fill the provided buffer.
-    ///
-    /// # Arguments
-    ///
-    /// * `buf` - Buffer to write bytes read from disk.
-    pub fn read_exact(&mut self, buf: &mut [u8]) -> io::Result<()> {
-        // Make sure there is enough remaining bytes to fill buffer.
-        let remaining = self.remaining();
-        if remaining < buf.len() {
-            let kind = io::ErrorKind::UnexpectedEof;
-            return Err(io::Error::new(kind, "Reached EOF without filling buffer"));
+        // There is nothing to left to read, nothing to do.
+        let remaining = len.saturating_sub(offset);
+        if remaining == 0 {
+            return &mut [];
         }
 
-        // Read bytes to fill the buffer completely.
-        self.file.read_exact_at(buf, self.next)?;
-        self.next += buf.len() as u64;
-        Ok(())
-    }
+        // Only read until the end of snapshot.
+        let remaining = remaining.try_into().unwrap_or(usize::MAX);
+        let read_size = min(buf.len(), remaining);
 
-    /// Number of bytes remaining till end of storage.
-    pub fn remaining(&self) -> usize {
-        self.len.saturating_sub(self.next) as _
-    }
-
-    /// Commit the transaction.
-    ///
-    /// This does nothing but return the offset to next read on file.
-    pub fn commit(self) -> u64 {
-        self.next
+        // Slice that can be safely read from file.
+        &mut buf[..read_size]
     }
 }
 
-/// An append transaction against storage.
-///
-/// Changes made in the transaction are not visible to other transactions (across threads),
-/// unless it is successfully committed via [`AppendTxn::commit`]. If transaction goes out
-/// of scope without explicit commit then it is implicitly aborted.  When this happens, any
-/// bytes appended will be rolled back. However, explicit abort via [`AppendTxn::abort`] is
-/// still recommended so that you can handle errors.
-pub struct AppendTxn<'a> {
-    next: u64,
-    start: u64,
-    complete: bool,
-    file: &'a File,
-    len: &'a AtomicU64,
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lock::MutLock;
+    use anyhow::{Error, Result};
+    use std::{sync::atomic::AtomicUsize, thread};
+    use tempfile::tempdir;
 
-impl AppendTxn<'_> {
-    /// Append some bytes into storage.
-    ///
-    /// # Arguments
-    ///
-    /// * `buf` - Bytes to write into storage.
-    pub fn append(&mut self, buf: &[u8]) -> io::Result<()> {
-        self.file.write_all_at(buf, self.next)?;
-        self.next += buf.len() as u64;
-        Ok(())
-    }
+    const WRITERS: usize = 3;
+    const READERS: usize = 3;
+    const RECORD_SIZE: usize = 16;
 
-    /// Commit the transaction.
-    ///
-    /// Finalizes the transaction and commits any writes into storage.
-    /// Returns the offset in file where next will will occur. That is
-    /// also the size of storage at the end of this transaction.
-    ///
-    /// # Arguments
-    ///
-    /// * `flush` - Sync data to disk, flushing any intermediate buffers.
-    pub fn commit(mut self, flush: bool) -> io::Result<u64> {
-        // Flush writes to disk to guarantee durability.
-        // This quite severely affects performance, so is optional.
-        // We only perform this operation if there was some change made in transaction.
-        if flush && self.start != self.next {
-            self.file.sync_data()?;
-        }
+    #[test]
+    fn concurrent_reads_writes() -> Result<()> {
+        let dir = tempdir()?;
 
-        // Release the changes made in this transaction to other threads.
-        if self.start != self.next {
-            self.len.store(self.next, Release);
-        }
+        // Create storage at a specified path.
+        let lock = MutLock::new();
+        let path = dir.path().join("test.storage");
+        let storage = Storage::create(&path)?;
 
-        // Mark transaction as explicitly completed.
-        // This prevents implicit abort during drop.
-        self.complete = true;
+        // Writes to make against storage.
+        let index = AtomicUsize::new(0);
+        let data: Vec<_> = (1..=100000).map(u128::to_be_bytes).collect();
 
-        // Return offset for next write.
-        Ok(self.next)
-    }
+        // Have multiple threads attempt to read and write from storage.
+        thread::scope(|scope| {
+            // Writers attempting to insert data into storage.
+            for _ in 0..WRITERS {
+                scope.spawn(|| {
+                    loop {
+                        // Obtain an exclusive write lock.
+                        let Some(guard) = lock.try_lock() else {
+                            continue;
+                        };
 
-    /// Abort the transaction.
-    ///
-    /// This rolls back changes accumulated in the transaction. If this operation
-    /// is successful, appends from this transaction will never be visible in other
-    /// transaction. If it does error out, storage is in undefined state.
-    ///
-    /// Returns the offset in file where next will will occur. That is also the size
-    /// of storage at the end of this transaction.
-    pub fn abort(mut self) -> io::Result<u64> {
-        // Undo changes made in this transaction by truncating the underlying file.
-        // We only perform this operation if there was some change made in transaction.
-        if self.next != self.start {
-            self.file.set_len(self.start)?;
-        }
+                        // Figure out next index to append into storage.
+                        let next_index = index.fetch_add(1, Relaxed);
+                        if next_index >= data.len() {
+                            break;
+                        }
 
-        // Mark transaction as explicitly completed.
-        // This prevents implicit abort during drop.
-        self.complete = true;
+                        // Append data into storage.
+                        let buf = &data[next_index];
+                        storage.append(buf, &guard)?;
+                    }
 
-        // Return offset for next write.
-        Ok(self.start)
-    }
-}
+                    Ok::<_, Error>(())
+                });
+            }
 
-impl Drop for AppendTxn<'_> {
-    fn drop(&mut self) {
-        // If the transaction was completed without being committed
-        // it's implicitly aborted. If there were some (successful)
-        // writes into storage, then we undo that now.
-        if !self.complete && self.start != self.next {
-            // There is no way to return an error back from destructor.
-            // The best we can do is to attempt (unless panic). It it
-            // okay, because new offset will not be visible to anyone.
-            // It will be get clean up in next maintenance run.
-            let _ = self.file.set_len(self.start);
-        }
+            // Readers attempting to read data from storage.
+            for _ in 0..READERS {
+                scope.spawn(|| {
+                    let mut index = 0;
+                    let mut buf = [0; RECORD_SIZE];
+                    loop {
+                        // Figure out the next piece of data to read.
+                        if index >= data.len() {
+                            break;
+                        }
+
+                        // Attempt to read data from storage.
+                        // Requested bytes might exist in storage yet.
+                        let offset = (index * RECORD_SIZE) as u64;
+                        if storage.read_at(offset, &mut buf)? != buf.len() {
+                            continue;
+                        }
+
+                        // Make sure contents of data is as expected.
+                        assert_eq!(&buf, &data[index]);
+                        index += 1;
+                    }
+
+                    Ok::<_, Error>(())
+                });
+            }
+        });
+
+        Ok(storage.close()?)
     }
 }
