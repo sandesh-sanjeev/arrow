@@ -292,3 +292,90 @@ mod tests {
         Ok(storage.close()?)
     }
 }
+
+#[cfg(test)]
+mod storage_bench {
+    use super::*;
+    use crate::lock::MutLock;
+    use anyhow::{Result, anyhow};
+    use std::time::{Duration, Instant};
+    use tempfile::tempdir;
+
+    const APPEND_SIZE: usize = 1024 * 1024;
+    const MAX_STORAGE_SIZE: usize = 256 * 1024 * 1024 * 1024;
+    const TOTAL_APPENDS: usize = MAX_STORAGE_SIZE / APPEND_SIZE;
+    const FLUSH_INTERVAL: Duration = Duration::from_secs(1);
+
+    #[test]
+    #[ignore = "Moving to /benches"]
+    fn storage_write_only_no_sync() -> Result<()> {
+        // Create storage at a specified path.
+        let tmp_dir = tempdir()?;
+        let path = tmp_dir.path().join("bench.storage");
+        let storage = Storage::create(&path)?;
+        println!("Storage path: {path:?}");
+
+        // Run benchmark.
+        let lock = MutLock::new();
+        let data = vec![6; APPEND_SIZE];
+        let start = Instant::now();
+        for _ in 0..TOTAL_APPENDS {
+            let Some(guard) = lock.try_lock() else {
+                return Err(anyhow!("Should obtain write lock"));
+            };
+
+            storage.append(&data, &guard)?;
+        }
+
+        // Register results.
+        let time = start.elapsed();
+        let (latency, throughput) = summary(time.as_secs_f64(), 1);
+        println!("Single writer no sync: {latency:.2} ms, {throughput:.2} MB/s");
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "Moving to /benches"]
+    fn storage_write_only_sync() -> Result<()> {
+        // Create storage at a specified path.
+        let tmp_dir = tempdir()?;
+        let path = tmp_dir.path().join("bench.storage");
+        let storage = Storage::create(&path)?;
+        println!("Storage path: {path:?}");
+
+        // Run benchmark.
+        let lock = MutLock::new();
+        let data = vec![9; APPEND_SIZE];
+        let start = Instant::now();
+        let mut flush = Instant::now();
+        for _ in 0..TOTAL_APPENDS {
+            let Some(guard) = lock.try_lock() else {
+                return Err(anyhow!("Should obtain write lock"));
+            };
+
+            storage.append(&data, &guard)?;
+            if flush.elapsed() >= FLUSH_INTERVAL {
+                storage.sync()?;
+                flush = Instant::now();
+            }
+        }
+
+        // Register results.
+        let time = start.elapsed();
+        let (latency, throughput) = summary(time.as_secs_f64(), 1);
+        println!("Single writer no sync: {latency:.2} ms, {throughput:.2} MB/s");
+        Ok(())
+    }
+
+    fn summary(time: f64, workers: usize) -> (f64, f64) {
+        let total_bytes = (TOTAL_APPENDS * APPEND_SIZE) * workers;
+        let throughput = match time {
+            seconds if seconds == 0.0 => total_bytes as f64,
+            seconds => total_bytes as f64 / seconds,
+        };
+
+        let mbps = throughput / (1024.0 * 1024.0);
+        let latency = (time / TOTAL_APPENDS as f64) * 1000.0;
+        (latency, mbps)
+    }
+}
