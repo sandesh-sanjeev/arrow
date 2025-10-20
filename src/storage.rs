@@ -429,4 +429,306 @@ mod tests {
 
         Ok(storage.close()?)
     }
+
+    #[test]
+    fn read_at_empty_buf_noop() -> Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("test.storage");
+        let storage = Storage::create(&path)?;
+
+        // Append some bytes to storage.
+        match LOCK.try_lock() {
+            None => Err(anyhow!("Should obtain write lock"))?,
+            Some(guard) => storage.append(TEST_BUF, &guard)?,
+        };
+
+        // Read buffer is empty.
+        // This is okay, nothing should be returned.
+        let mut read_buf = Vec::new();
+        storage.read_at(0, &mut read_buf)?;
+
+        Ok(storage.close()?)
+    }
+
+    #[test]
+    fn read_at_enough_bytes_available_copies_bytes() -> Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("test.storage");
+        let storage = Storage::create(&path)?;
+
+        // Append some bytes to storage.
+        match LOCK.try_lock() {
+            None => Err(anyhow!("Should obtain write lock"))?,
+            Some(guard) => storage.append(TEST_BUF, &guard)?,
+        };
+
+        // Buffer size is exactly equal to the number of bytes available.
+        // However read_at is allowed to spuriously returned early, even if more bytes
+        // are available. So, we'll need to read in a loop (till everything is read).
+        let mut offset = 0;
+        let mut read_buf = vec![0; TEST_BUF.len()];
+        let mut buf = read_buf.as_mut_slice();
+        while !buf.is_empty() {
+            // Read as many bytes as storage returns.
+            let read = storage.read_at(offset, &mut buf)?;
+
+            // Consume all the bytes read from storage.
+            offset += read as u64;
+            buf = &mut buf[read..];
+        }
+
+        // Make sure bytes were copied correctly.
+        assert_eq!(TEST_BUF, read_buf.as_slice());
+
+        Ok(storage.close()?)
+    }
+
+    #[test]
+    fn read_exact_at_empty_buf_noop() -> Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("test.storage");
+        let storage = Storage::create(&path)?;
+
+        // Append some bytes to storage.
+        match LOCK.try_lock() {
+            None => Err(anyhow!("Should obtain write lock"))?,
+            Some(guard) => storage.append(TEST_BUF, &guard)?,
+        };
+
+        // Read buffer is empty.
+        // This is okay regardless of number of bytes in storage.
+        let mut read_buf = Vec::new();
+        storage.read_exact_at(0, &mut read_buf)?;
+
+        Ok(storage.close()?)
+    }
+
+    #[test]
+    fn read_exact_at_not_enough_bytes_returns_error() -> Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("test.storage");
+        let storage = Storage::create(&path)?;
+
+        // Append some bytes to storage.
+        match LOCK.try_lock() {
+            None => Err(anyhow!("Should obtain write lock"))?,
+            Some(guard) => storage.append(TEST_BUF, &guard)?,
+        };
+
+        // Buffer size is greater than total number of bytes available.
+        let mut read_buf = vec![0; TEST_BUF.len() + 10];
+        let Err(_) = storage.read_exact_at(0, &mut read_buf) else {
+            return Err(anyhow!("Should fail, requested bytes are not available"));
+        };
+
+        Ok(storage.close()?)
+    }
+
+    #[test]
+    fn read_exact_at_enough_bytes_available_copies_bytes() -> Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("test.storage");
+        let storage = Storage::create(&path)?;
+
+        // Append some bytes to storage.
+        match LOCK.try_lock() {
+            None => Err(anyhow!("Should obtain write lock"))?,
+            Some(guard) => storage.append(TEST_BUF, &guard)?,
+        };
+
+        // Buffer size is exactly equal to the number of bytes available.
+        let mut read_buf = vec![0; TEST_BUF.len()];
+        storage.read_exact_at(0, &mut read_buf)?;
+        assert_eq!(TEST_BUF, read_buf.as_slice());
+
+        Ok(storage.close()?)
+    }
+
+    #[test]
+    fn truncate_length_gte_storage_len_noop() -> Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("test.storage");
+        let mut storage = Storage::create(&path)?;
+
+        // Append some bytes to storage.
+        match LOCK.try_lock() {
+            None => Err(anyhow!("Should obtain write lock"))?,
+            Some(guard) => storage.append(TEST_BUF, &guard)?,
+        };
+
+        // Truncation length >= storage length should be no-op.
+        storage.truncate(TEST_BUF.len() as u64)?;
+        storage.truncate(TEST_BUF.len() as u64 + 100)?;
+
+        // Size of storage should remain unchanged.
+        assert_eq!(TEST_BUF.len() as u64, storage.len());
+
+        Ok(storage.close()?)
+    }
+
+    #[test]
+    fn truncate_length_smaller_than_storage_len_truncates() -> Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("test.storage");
+        let mut storage = Storage::create(&path)?;
+
+        // Append some bytes to storage.
+        match LOCK.try_lock() {
+            None => Err(anyhow!("Should obtain write lock"))?,
+            Some(guard) => storage.append(TEST_BUF, &guard)?,
+        };
+
+        // Truncation length < storage length should truncate storage.
+        storage.truncate(TEST_BUF.len() as u64 - 10)?;
+
+        // Size of storage should remain unchanged.
+        assert_eq!(TEST_BUF.len() as u64 - 10, storage.len());
+
+        // Make sure contents of storage is as expected.
+        let mut read_buf = vec![0; TEST_BUF.len() - 10];
+        storage.read_exact_at(0, &mut read_buf)?;
+        assert_eq!(&TEST_BUF[..TEST_BUF.len() - 10], read_buf.as_slice());
+
+        Ok(storage.close()?)
+    }
+
+    #[test]
+    fn open_preserves_bytes_in_storage() -> Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("test.storage");
+        let storage = Storage::create(&path)?;
+
+        // Append some bytes to storage.
+        match LOCK.try_lock() {
+            None => Err(anyhow!("Should obtain write lock"))?,
+            Some(guard) => storage.append(TEST_BUF, &guard)?,
+        };
+
+        // Close storage and reopen.
+        storage.close()?;
+        let storage = Storage::open(&path)?;
+
+        // Make sure all bytes are visible.
+        let mut read_buf = vec![0; TEST_BUF.len()];
+        storage.read_exact_at(0, &mut read_buf)?;
+        assert_eq!(TEST_BUF, read_buf.as_slice());
+
+        // Add more bytes and make sure they are visible too.
+        let more_buf = b"blah";
+        match LOCK.try_lock() {
+            None => Err(anyhow!("Should obtain write lock"))?,
+            Some(guard) => storage.append(more_buf, &guard)?,
+        };
+
+        // Close storage and reopen.
+        storage.close()?;
+        let storage = Storage::open(&path)?;
+
+        // Make sure all bytes are visible.
+        let mut read_buf = vec![0; more_buf.len()];
+        storage.read_exact_at(TEST_BUF.len() as u64, &mut read_buf)?;
+        assert_eq!(more_buf, read_buf.as_slice());
+
+        Ok(storage.close()?)
+    }
+
+    #[test]
+    fn destroy_nukes_storage() -> Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("test.storage");
+        let storage = Storage::create(&path)?;
+
+        // Destroy storage.
+        storage.destroy()?;
+
+        // Once destroyed, storage should be able to be created
+        // in the same path. Because nothing exists there.
+        let storage = Storage::create(&path)?;
+
+        Ok(storage.close()?)
+    }
+}
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod concurrency {
+    use super::*;
+    use crate::lock::MutLock;
+    use anyhow::{Error, Result};
+    use std::{sync::atomic::AtomicUsize, thread};
+    use tempfile::tempdir;
+
+    const WRITERS: usize = 3;
+    const READERS: usize = 3;
+    const RECORD_SIZE: usize = 16;
+
+    #[test]
+    fn parallel_reads_and_writes() -> Result<()> {
+        let dir = tempdir()?;
+
+        // Create storage at a specified path.
+        let lock = MutLock::new();
+        let path = dir.path().join("test.storage");
+        let storage = Storage::create(&path)?;
+
+        // Writes to make against storage.
+        let index = AtomicUsize::new(0);
+        let data: Vec<_> = (1..=100000).map(u128::to_be_bytes).collect();
+
+        // Have multiple threads attempt to read and write from storage.
+        thread::scope(|scope| {
+            // Writers attempting to insert data into storage.
+            for _ in 0..WRITERS {
+                scope.spawn(|| {
+                    loop {
+                        // Obtain an exclusive write lock first.
+                        let Some(guard) = lock.try_lock() else {
+                            continue;
+                        };
+
+                        // Figure out next index to append into storage.
+                        let next_index = index.fetch_add(1, Relaxed);
+                        if next_index >= data.len() {
+                            break;
+                        }
+
+                        // Append data into storage.
+                        let buf = &data[next_index];
+                        storage.append(buf, &guard)?;
+                    }
+
+                    Ok::<_, Error>(())
+                });
+            }
+
+            // Readers attempting to read data from storage.
+            for _ in 0..READERS {
+                scope.spawn(|| {
+                    let mut index = 0;
+                    let mut buf = [0; RECORD_SIZE];
+                    loop {
+                        // Figure out the next piece of data to read.
+                        if index >= data.len() {
+                            break;
+                        }
+
+                        // Attempt to read data from storage.
+                        // Requested bytes might exist in storage yet.
+                        let offset = (index * RECORD_SIZE) as u64;
+                        if storage.read_at(offset, &mut buf)? != buf.len() {
+                            continue;
+                        }
+
+                        // Make sure contents of data is as expected.
+                        assert_eq!(&buf, &data[index]);
+                        index += 1;
+                    }
+
+                    Ok::<_, Error>(())
+                });
+            }
+        });
+
+        Ok(storage.close()?)
+    }
 }
