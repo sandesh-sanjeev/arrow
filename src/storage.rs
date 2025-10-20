@@ -10,6 +10,42 @@ use std::{
     sync::atomic::{AtomicU64, Ordering::*},
 };
 
+/// An append only storage of bytes.
+///
+/// # Concurrency
+///
+/// A single writer can append bytes to storage at a time. To enforce this, append
+/// operation requires caller to have a reference to a [`MutGuard`]. This is not fool
+/// proof, because this data-structure does not own the lock for performance reasons.
+/// The idea is to obtain a write lock for the entire ring buffer, but individual
+/// components of the ring buffer.
+///
+/// Any number of readers can concurrently read from storage without any form of
+/// synchronization or locking. Readers view storage as it was when a read operation
+/// started, meaning readers can never conflict with writers.
+///
+/// However, note that there is currently no way to protect against mutable access across
+/// processes. If/when that support arrives, it's going to advisory at best.
+///
+/// # Durability
+///
+/// Appends don't implicitly sync data to set with every append for performance reasons.
+/// To make sure writes have actually made it to disk, explicitly call [`Storage::sync`].
+/// Alternatively make all writes sync to disk via `O_SYNC` (not yet supported).
+///
+/// # Truncate
+///
+/// Regardless of what we do, it's possible for partial writes to exist on disk. This is
+/// especially the case during I/O errors or system/process crashes. So it's high recommended
+/// to have a mechanism to detect corruption, for example using checksums.
+///
+/// And when you do detect corruption, you can either just throw errors or attempt to fix it.
+/// The only mechanism available to fix corruption is by truncating storage to a length that
+/// does not have corruption. Use [`Storage::truncate`] to trim off corrupted bytes.
+///
+/// It is not safe to truncate storage while there are concurrent readers. Thus, the operation
+/// requires mutable reference to storage. The assumption is that truncation happens once during
+/// process activation, so this is okay.
 pub struct Storage {
     file: File,
     path: PathBuf,
@@ -61,6 +97,16 @@ impl Storage {
             len: AtomicU64::new(len),
             path: path.as_ref().to_path_buf(),
         })
+    }
+
+    /// Returns the current size (in bytes) of storage.
+    pub fn len(&self) -> u64 {
+        self.len.load(Relaxed)
+    }
+
+    /// Returns true if storage has no bytes, false otherwise.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
     /// Append some bytes into storage.
@@ -211,171 +257,176 @@ impl Storage {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use crate::lock::MutLock;
-    use anyhow::{Error, Result};
-    use std::{sync::atomic::AtomicUsize, thread};
+    use anyhow::{Result, anyhow};
     use tempfile::tempdir;
 
-    const WRITERS: usize = 3;
-    const READERS: usize = 3;
-    const RECORD_SIZE: usize = 16;
+    // Exclusive lock for storage mutations.
+    const LOCK: MutLock = MutLock::new();
+
+    // Some random test data.
+    const TEST_BUF: &[u8] = b"Batman is better than superman!";
 
     #[test]
-    fn concurrent_reads_writes() -> Result<()> {
+    fn create_does_not_exist_returns_storage() -> Result<()> {
         let dir = tempdir()?;
-
-        // Create storage at a specified path.
-        let lock = MutLock::new();
         let path = dir.path().join("test.storage");
+
+        // Should succeed because storage doesn't exist already.
+        // Newly created storage should occupy no space.
         let storage = Storage::create(&path)?;
-
-        // Writes to make against storage.
-        let index = AtomicUsize::new(0);
-        let data: Vec<_> = (1..=100000).map(u128::to_be_bytes).collect();
-
-        // Have multiple threads attempt to read and write from storage.
-        thread::scope(|scope| {
-            // Writers attempting to insert data into storage.
-            for _ in 0..WRITERS {
-                scope.spawn(|| {
-                    loop {
-                        // Obtain an exclusive write lock.
-                        let Some(guard) = lock.try_lock() else {
-                            continue;
-                        };
-
-                        // Figure out next index to append into storage.
-                        let next_index = index.fetch_add(1, Relaxed);
-                        if next_index >= data.len() {
-                            break;
-                        }
-
-                        // Append data into storage.
-                        let buf = &data[next_index];
-                        storage.append(buf, &guard)?;
-                    }
-
-                    Ok::<_, Error>(())
-                });
-            }
-
-            // Readers attempting to read data from storage.
-            for _ in 0..READERS {
-                scope.spawn(|| {
-                    let mut index = 0;
-                    let mut buf = [0; RECORD_SIZE];
-                    loop {
-                        // Figure out the next piece of data to read.
-                        if index >= data.len() {
-                            break;
-                        }
-
-                        // Attempt to read data from storage.
-                        // Requested bytes might exist in storage yet.
-                        let offset = (index * RECORD_SIZE) as u64;
-                        if storage.read_at(offset, &mut buf)? != buf.len() {
-                            continue;
-                        }
-
-                        // Make sure contents of data is as expected.
-                        assert_eq!(&buf, &data[index]);
-                        index += 1;
-                    }
-
-                    Ok::<_, Error>(())
-                });
-            }
-        });
+        assert!(storage.is_empty());
 
         Ok(storage.close()?)
     }
-}
-
-#[cfg(test)]
-mod storage_bench {
-    use super::*;
-    use crate::lock::MutLock;
-    use anyhow::{Result, anyhow};
-    use std::time::{Duration, Instant};
-    use tempfile::tempdir;
-
-    const APPEND_SIZE: usize = 1024 * 1024;
-    const MAX_STORAGE_SIZE: usize = 256 * 1024 * 1024 * 1024;
-    const TOTAL_APPENDS: usize = MAX_STORAGE_SIZE / APPEND_SIZE;
-    const FLUSH_INTERVAL: Duration = Duration::from_secs(1);
 
     #[test]
-    #[ignore = "Moving to /benches"]
-    fn storage_write_only_no_sync() -> Result<()> {
-        // Create storage at a specified path.
-        let tmp_dir = tempdir()?;
-        let path = tmp_dir.path().join("bench.storage");
+    fn create_already_exists_returns_error() -> Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("test.storage");
+
+        // Create for the first time.
         let storage = Storage::create(&path)?;
-        println!("Storage path: {path:?}");
+        storage.close()?;
 
-        // Run benchmark.
-        let lock = MutLock::new();
-        let data = vec![6; APPEND_SIZE];
-        let start = Instant::now();
-        for _ in 0..TOTAL_APPENDS {
-            let Some(guard) = lock.try_lock() else {
-                return Err(anyhow!("Should obtain write lock"));
-            };
-
-            storage.append(&data, &guard)?;
-        }
-
-        // Register results.
-        let time = start.elapsed();
-        let (latency, throughput) = summary(time.as_secs_f64(), 1);
-        println!("Single writer no sync: {latency:.2} ms, {throughput:.2} MB/s");
-        Ok(())
-    }
-
-    #[test]
-    #[ignore = "Moving to /benches"]
-    fn storage_write_only_sync() -> Result<()> {
-        // Create storage at a specified path.
-        let tmp_dir = tempdir()?;
-        let path = tmp_dir.path().join("bench.storage");
-        let storage = Storage::create(&path)?;
-        println!("Storage path: {path:?}");
-
-        // Run benchmark.
-        let lock = MutLock::new();
-        let data = vec![9; APPEND_SIZE];
-        let start = Instant::now();
-        let mut flush = Instant::now();
-        for _ in 0..TOTAL_APPENDS {
-            let Some(guard) = lock.try_lock() else {
-                return Err(anyhow!("Should obtain write lock"));
-            };
-
-            storage.append(&data, &guard)?;
-            if flush.elapsed() >= FLUSH_INTERVAL {
-                storage.sync()?;
-                flush = Instant::now();
-            }
-        }
-
-        // Register results.
-        let time = start.elapsed();
-        let (latency, throughput) = summary(time.as_secs_f64(), 1);
-        println!("Single writer no sync: {latency:.2} ms, {throughput:.2} MB/s");
-        Ok(())
-    }
-
-    fn summary(time: f64, workers: usize) -> (f64, f64) {
-        let total_bytes = (TOTAL_APPENDS * APPEND_SIZE) * workers;
-        let throughput = match time {
-            seconds if seconds == 0.0 => total_bytes as f64,
-            seconds => total_bytes as f64 / seconds,
+        // Try to create against should return an error.
+        let Err(_) = Storage::create(&path) else {
+            return Err(anyhow!("Storage should not be created again"));
         };
 
-        let mbps = throughput / (1024.0 * 1024.0);
-        let latency = (time / TOTAL_APPENDS as f64) * 1000.0;
-        (latency, mbps)
+        Ok(())
+    }
+
+    #[test]
+    fn append_empty_buf_noop() -> Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("test.storage");
+        let storage = Storage::create(&path)?;
+
+        // Append empty slice of bytes
+        match LOCK.try_lock() {
+            None => Err(anyhow!("Should obtain write lock"))?,
+            Some(guard) => storage.append(b"", &guard)?,
+        };
+
+        // No bytes should exist in storage.
+        assert!(storage.is_empty());
+
+        Ok(storage.close()?)
+    }
+
+    #[test]
+    fn append_buf_not_empty_updates_storage() -> Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("test.storage");
+        let storage = Storage::create(&path)?;
+
+        // Append some bytes to storage.
+        match LOCK.try_lock() {
+            None => Err(anyhow!("Should obtain write lock"))?,
+            Some(guard) => storage.append(TEST_BUF, &guard)?,
+        };
+
+        // Size of storage should reflect the append.
+        assert_eq!(TEST_BUF.len() as u64, storage.len());
+
+        // Appended bytes should be readable.
+        let mut read_buf = vec![0; TEST_BUF.len()];
+        storage.read_exact_at(0, &mut read_buf)?;
+        assert_eq!(TEST_BUF, read_buf.as_slice());
+
+        Ok(storage.close()?)
+    }
+
+    #[test]
+    fn size_read_buf_empty_buf_returns_empty_buf() -> Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("test.storage");
+        let storage = Storage::create(&path)?;
+
+        // Append some bytes to storage.
+        match LOCK.try_lock() {
+            None => Err(anyhow!("Should obtain write lock"))?,
+            Some(guard) => storage.append(TEST_BUF, &guard)?,
+        };
+
+        // Empty buffer should not be resized.
+        let mut read_buf = [];
+        let sized_buf = storage.size_read_buf(0, &mut read_buf);
+        assert!(sized_buf.is_empty());
+
+        Ok(storage.close()?)
+    }
+
+    #[test]
+    fn size_read_buf_nothing_remaining_empty_buf() -> Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("test.storage");
+        let storage = Storage::create(&path)?;
+
+        // Append some bytes to storage.
+        match LOCK.try_lock() {
+            None => Err(anyhow!("Should obtain write lock"))?,
+            Some(guard) => storage.append(TEST_BUF, &guard)?,
+        };
+
+        // Read after exact end of file.
+        let mut read_buf = vec![0; TEST_BUF.len()];
+        let sized_buf = storage.size_read_buf(storage.len(), &mut read_buf);
+        assert!(sized_buf.is_empty());
+
+        // Read beyond the end of file.
+        let sized_buf = storage.size_read_buf(storage.len() + 65, &mut read_buf);
+        assert!(sized_buf.is_empty());
+
+        Ok(storage.close()?)
+    }
+
+    #[test]
+    fn size_read_buf_not_enough_remaining_shrinks_buf() -> Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("test.storage");
+        let storage = Storage::create(&path)?;
+
+        // Append some bytes to storage.
+        match LOCK.try_lock() {
+            None => Err(anyhow!("Should obtain write lock"))?,
+            Some(guard) => storage.append(TEST_BUF, &guard)?,
+        };
+
+        // Should shrink buffer to fit remaining bytes.
+        let mut read_buf = vec![0; TEST_BUF.len() + 10];
+        let sized_buf = storage.size_read_buf(0, &mut read_buf);
+        assert_eq!(TEST_BUF.len(), sized_buf.len());
+
+        Ok(storage.close()?)
+    }
+
+    #[test]
+    fn size_read_buf_enough_remaining_does_not_resize() -> Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("test.storage");
+        let storage = Storage::create(&path)?;
+
+        // Append some bytes to storage.
+        match LOCK.try_lock() {
+            None => Err(anyhow!("Should obtain write lock"))?,
+            Some(guard) => storage.append(TEST_BUF, &guard)?,
+        };
+
+        // Request equal to remaining.
+        let mut read_buf = vec![0; TEST_BUF.len()];
+        let sized_buf = storage.size_read_buf(0, &mut read_buf);
+        assert_eq!(TEST_BUF.len(), sized_buf.len());
+
+        // Request less than remaining.
+        let mut read_buf = vec![0; 3];
+        let sized_buf = storage.size_read_buf(0, &mut read_buf);
+        assert_eq!(3, sized_buf.len());
+
+        Ok(storage.close()?)
     }
 }

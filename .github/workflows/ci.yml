@@ -31,11 +31,44 @@ jobs:
       - name: Deny cargo clippy warnings
         run: cargo clippy -- --deny warnings --no-deps
 
+      - name: Clean build artifacts
+        run: cargo clean
+
       - name: Build crate
         run: cargo build
       
       - name: Test crate
         run: cargo test
+
+  coverage:
+    name: Coverage
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Setup rust (Nightly)
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: nightly
+          components: llvm-tools
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Clean coverage artifacts
+        run: cargo llvm-cov clean
+
+      - name: Generate code coverage
+        run: cargo llvm-cov test --lcov --output-path lcov.info
+
+      - name: Coveralls
+        uses: coverallsapp/github-action@v2
+        with:
+          file: lcov.info
+          github-token: ${{ secrets.GITHUB_TOKEN }}
 
   docs:
     name: Docs
