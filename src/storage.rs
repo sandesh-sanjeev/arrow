@@ -31,12 +31,12 @@ use std::{
 ///
 /// Appends don't implicitly sync data to set with every append for performance reasons.
 /// To make sure writes have actually made it to disk, explicitly call [`Storage::sync`].
-/// Alternatively make all writes sync to disk via `O_SYNC` (not yet supported).
+/// Alternatively make all writes sync to disk via `O_SYNC`/`O_DSYNC` (not yet supported).
 ///
-/// # Truncate
+/// # Corruption
 ///
 /// Regardless of what we do, it's possible for partial writes to exist on disk. This is
-/// especially the case during I/O errors or system/process crashes. So it's high recommended
+/// especially the case during I/O errors or system/process crashes. So it's highly recommended
 /// to have a mechanism to detect corruption, for example using checksums.
 ///
 /// And when you do detect corruption, you can either just throw errors or attempt to fix it.
@@ -728,6 +728,16 @@ mod concurrency {
                 });
             }
         });
+
+        // Read all bytes from storage.
+        let total_size: usize = data.iter().map(|slice| slice.len()).sum();
+        let mut buf = vec![0; total_size];
+        storage.read_exact_at(0, &mut buf)?;
+
+        // Make sure those bytes are correct.
+        for (i, record) in buf.chunks(RECORD_SIZE).enumerate() {
+            assert_eq!(record, data[i]);
+        }
 
         Ok(storage.close()?)
     }
