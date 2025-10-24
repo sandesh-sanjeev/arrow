@@ -593,6 +593,17 @@ mod tests {
     }
 
     #[test]
+    fn open_does_not_exist_returns_error() -> Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("test.storage");
+
+        match Storage::open(&path) {
+            Err(_) => Ok(()),
+            Ok(_) => Err(anyhow!("Should not open storage that does not exist")),
+        }
+    }
+
+    #[test]
     fn open_preserves_bytes_in_storage() -> Result<()> {
         let dir = tempdir()?;
         let path = dir.path().join("test.storage");

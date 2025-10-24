@@ -12,6 +12,7 @@
 // To customize parts of code that is included in coverage analysis.
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 
+pub mod buf;
 pub mod lock;
 pub mod log;
 pub mod storage;

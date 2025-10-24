@@ -3,3 +3,6 @@ Cargo.lock
 
 # Do not check in build artifacts.
 /target
+
+# Do not check in coverage artifacts.
+lcov.info
